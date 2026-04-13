@@ -1,0 +1,285 @@
+# CME Arrival Time Prediction — Full Project Context Summary
+
+## Project Overview
+
+**Goal:** Build a deep learning system to predict Coronal Mass Ejection (CME) arrival times at Earth's L1 point, with applications for satellite early-warning systems.
+
+**Environment:** Google Colab, T4 GPU, Python 3.12, TensorFlow 2.x, mixed float16 precision enabled.
+
+---
+
+## Architecture
+
+**Model name:** `CME_BiLSTM_Attn`
+
+```
+Input → (None, 10, 27)   [batch, SEQ_LEN=10, n_features=27]
+  ↓
+Bidirectional LSTM (u1=256, return_sequences=True) + LayerNorm + Dropout(0.3)
+  ↓
+Bidirectional LSTM (u2=128, return_sequences=True) + LayerNorm + Dropout(0.21)
+  ↓
+LSTM (u3=64, return_sequences=True)
+  ↓
+Temporal Attention Block
+  score  = Dense(1, tanh)(x)          → (B, T, 1)
+  weight = Softmax(axis=1)(score)     → (B, T, 1)   ← named 'attn'
+  ctx    = sum(x * weight, axis=1)    → (B, 64)
+  ↓
+Dense(64, relu) → Dropout(0.2) → Dense(32, relu) → Dense(1, float32)
+
+Loss:     Huber
+Optimizer: AdamW (lr=3e-4, weight_decay=1e-5)
+Metric:   MAE
+```
+
+---
+
+## Dataset
+
+- **Source:** Physics-informed synthetic data via **Drag-Based Model** (Vršnak et al. 2013)
+- **Size:** 3,000 CME events generated with `generate_dataset(n=3000, seed=42)`
+- **Target:** `transit_hours` — clipped to `[20, 120]` hours
+- **Date range:** 2010–2024 (synthetic dates)
+- **Raw features (14):** `date, v_cme, half_angle, lat, lon, mpa, v_sw, n_sw, b_total, bz, by, kp, dst, flare_int`
+
+### Feature Engineering — `engineer_features()` adds 13 more:
+| Engineered Feature | Formula |
+|---|---|
+| `month_sin / month_cos` | Cyclical month encoding |
+| `solar_cycle_phase` | `sin(2π(year−2008)/11)` |
+| `speed_excess` | `v_cme − v_sw` |
+| `speed_ratio` | `v_cme / v_sw` |
+| `ram_pressure` | `n_sw × v_sw²` |
+| `b_angle` | `arctan2(bz, by)` |
+| `cone_angle` | `half_angle × π/180` |
+| `src_distance` | `√(lat² + lon²)` |
+| `alfven_speed` | `B / √(4π×10⁻⁷ × n_sw × m_p)` |
+| `mach_number` | `v_cme / alfven_speed` |
+| `expansion_factor` | `tan(cone_angle)` |
+| `log_v_cme` | `log1p(v_cme)` |
+| `log_n_sw / log_b_total` | `log1p(n_sw)`, `log1p(b_total)` |
+
+**Final `FEATURE_COLS` = 27 features, `SEQ_LEN = 10`, `TARGET_COL = 'transit_hours'`**
+
+---
+
+## Data Pipeline
+
+```python
+# Scaling
+scaler_X = StandardScaler()   # fits on X (27 features)
+scaler_y = StandardScaler()   # fits on y (transit_hours)
+
+# Sequences: rolling window of SEQ_LEN=10
+# X_seq shape: (N-10, 10, 27)
+# y_seq shape: (N-10, 1)
+
+# Chronological split (no shuffle — time series)
+# Train: 70% | Val: 15% | Test: 15%
+n_tr  = int(0.70 * n)
+n_val = int(0.15 * n)
+X_train, y_train = X_seq[:n_tr],           y_seq[:n_tr]
+X_val,   y_val   = X_seq[n_tr:n_tr+n_val], y_seq[n_tr:n_tr+n_val]
+X_test,  y_test  = X_seq[n_tr+n_val:],     y_seq[n_tr+n_val:]
+```
+
+---
+
+## Training — Cell 9
+
+```python
+callbacks:
+  ModelCheckpoint  → 'best_model.keras'   (monitor val_mae, save_best_only)
+  EarlyStopping    → patience=20, min_delta=0.001
+  ReduceLROnPlateau → factor=0.5, patience=8, min_lr=1e-6
+
+epochs=150, batch_size=64, shuffle=False
+```
+
+---
+
+## Full Cell-by-Cell Status
+
+| Cell | Title | Status |
+|------|-------|--------|
+| 1 | Environment Setup & GPU | ✅ Works — `shap` install **removed** |
+| 2 | Imports | ✅ Works — `import shap` line **removed** |
+| 3 | NASA DONKI API fetch | ✅ Works (graceful fallback if API fails) |
+| 4 | DBM synthetic dataset | ✅ Works |
+| 5 | EDA + Correlation matrix | ✅ Works |
+| 6 | Feature engineering | ✅ Works |
+| 7 | Sequence prep + splits | ✅ Works |
+| 8 | BiLSTM + Attention model | ✅ Works |
+| 9 | Training | ✅ Works |
+| 10 | Training curves | ✅ Works |
+| 11 | Test set evaluation | ✅ Works |
+| 12 | Attention visualisation | ✅ Works |
+| 13 | ~~SHAP~~ → **Permutation importance** | ✅ **Replaced** — SHAP DeepExplainer crashes on TF 2.12+ with mixed precision |
+| 14 | Optuna hyperparameter search (20 trials) | ✅ Works |
+| 15 | Retrain with best params → `model_opt` | ✅ Works |
+| 16 | LSTM + DBM Ensemble stacking | ✅ **Fixed** — `dbm_transit_safe()` added |
+| 17 | Early warning inference interface | ✅ Works |
+| 18 | Model export | ⚠️ **Partially fixed, still failing** |
+| 19 | Summary dashboard | ✅ Works (uses `fi_shap` from cell 13 — variable name preserved) |
+
+---
+
+## Bugs Fixed So Far
+
+### Bug 1 — Cell 13: `shap.DeepExplainer` crash
+**Error:** `AttributeError: 'NoneType' object has no attribute 'numpy'` + `InvalidArgumentError`
+
+**Root cause:** `shap.DeepExplainer` hooks into TF's internal gradient tape with assumptions broken in TF ≥ 2.12. Mixed float16 precision causes dtype mismatches deep in SHAP's backprop path.
+
+**Fix:** Replaced entire cell with **model-agnostic permutation importance**. Each feature is shuffled across test sequences independently, MAE degradation is measured. The result variable is still named `fi_shap` so cell 19 dashboard works unchanged.
+
+---
+
+### Bug 2 — Cell 16: `ValueError: Input contains NaN`
+**Error:** `sklearn` refused arrays containing NaN when computing ensemble MAE.
+
+**Root cause:** The original `dbm_transit()` formula for decelerating CMEs (`v_c > v_w`) is:
+```python
+t = (-1/gamma) * np.log(1 - gamma*(v_c-v_w)*d_m/v_c) / (v_c-v_w)
+```
+When `gamma*(v_c-v_w)*d_m/v_c ≥ 1`, the log argument ≤ 0 → `log(negative)` = NaN. This was hidden in cell 4 because each event used a randomised per-event `gamma_arr`. Cell 16 calls the function with the **default** `gamma=0.2e-7`, which is too large for high-speed CMEs over 1 AU distance.
+
+**Fix:** Replaced with `dbm_transit_safe()` — adds a guard checking `log_arg > 0` before calling `np.log`, falls back to kinematic mean speed formula when the condition is violated, hard-clips output to `[10, 120]` hours. Also added explicit `dtype=np.float64` casts on `y_pred_opt_h` and `y_true_h`.
+
+---
+
+### Bug 3 — Cell 18: `ConverterError` on TFLite export (current open issue)
+**Error:**
+```
+'tf.TensorListReserve' op requires element_shape to be static
+failed to legalize operation 'tf.TensorListReserve'
+```
+
+**Root cause:** BiLSTM uses `tf.TensorListReserve` and dynamic tensor list ops for its backward LSTM pass unrolling. TFLite's default lowering pass cannot handle dynamic shapes in tensor lists.
+
+**First fix attempt** (partially applied, still failing):
+```python
+conv.target_spec.supported_ops = [
+    tf.lite.OpsSet.TFLITE_BUILTINS,
+    tf.lite.OpsSet.SELECT_TF_OPS,
+]
+conv._experimental_lower_tensor_list_ops = False
+conv.optimizations = [tf.lite.Optimize.DEFAULT]
+conv.target_spec.supported_types = [tf.float16]
+```
+
+**Why it may still fail:** On some TF 2.x + Colab combinations, `SELECT_TF_OPS` + `_experimental_lower_tensor_list_ops = False` is insufficient for BiLSTM because the `recurrent_dropout=0.1` inside the LSTM layers forces a non-statically-unrollable graph. The recurrent dropout makes the model behave differently at train vs inference time in a way that generates additional dynamic ops.
+
+**Next approaches to try in the new chat (in order of preference):**
+
+**Option A — Strip recurrent dropout at export time (recommended):**
+```python
+# Build a new model with same weights but recurrent_dropout=0 for inference
+def build_model_for_export(seq_len, n_feat, bp):
+    # identical to build_model() but recurrent_dropout=0 everywhere
+    ...
+# Transfer weights then convert — static graph, no dynamic tensor lists
+```
+
+**Option B — Concrete function with static input signature:**
+```python
+@tf.function(input_signature=[tf.TensorSpec([1, 10, 27], tf.float32)])
+def serving_fn(x):
+    return model_opt(x, training=False)
+conv = tf.lite.TFLiteConverter.from_concrete_functions(
+    [serving_fn.get_concrete_function()]
+)
+```
+
+**Option C — Skip TFLite, export as SavedModel only:**
+```python
+# Just skip TFLite entirely — SavedModel + full Keras .keras file
+# are sufficient for all non-edge deployment targets
+```
+
+---
+
+## Key Variables in Scope (end of successful cells)
+
+```python
+# Data
+df           # raw dataset, 3000 rows, 15 cols
+df_feat      # with engineered features, 28 cols
+df_seq       # cleaned sequence-ready dataframe
+FEATURE_COLS # list of 27 feature names
+TARGET_COL   # 'transit_hours'
+SEQ_LEN      # 10
+
+# Scalers
+scaler_X     # StandardScaler fitted on 27 features
+scaler_y     # StandardScaler fitted on transit_hours
+
+# Splits
+X_train, y_train   # 70% — shape (n_tr-10, 10, 27)
+X_val,   y_val     # 15%
+X_test,  y_test    # 15%
+y_true_h           # inverse-transformed test labels (hours, float64)
+
+# Models
+model          # baseline BiLSTM (from cell 8/9)
+model_opt      # Optuna-optimised BiLSTM (from cell 15) ← main model
+study          # optuna.Study object with best_params
+
+# Predictions
+y_pred_h       # baseline model predictions (hours)
+y_pred_opt_h   # optimised model predictions (hours, float64)
+dbm_preds      # DBM-only predictions (hours, float64)
+y_ens          # ensemble: best_alpha*y_pred_opt_h + (1-best_alpha)*dbm_preds
+
+# Metrics
+mae, rmse, r2, mape, w6, w12   # baseline model metrics
+mae_opt, r2_opt                 # optimised model metrics
+mae_ens, r2_ens                 # ensemble metrics
+best_alpha                      # optimal LSTM weight in ensemble [0,1]
+
+# Feature importance
+fi_shap        # pd.Series — permutation importance (ΔMAE per feature)
+
+# History
+history        # baseline training history
+hist_opt       # optimised model training history
+
+# Paths
+DATA_DIR       # Path('/content/cme_data')
+```
+
+---
+
+## Files on Disk at `/content/cme_data/`
+
+| File | Description |
+|------|-------------|
+| `best_model.keras` | Best baseline model checkpoint |
+| `optimized.keras` | Best Optuna-optimised model checkpoint |
+| `cme_lstm_final.keras` | Final saved model (full Keras format) |
+| `scaler_X.pkl` | StandardScaler for input features |
+| `scaler_y.pkl` | StandardScaler for target |
+| `metadata.json` | Metrics, feature list, best Optuna params |
+| `eda.png` | Feature distribution plots |
+| `correlation.png` | Correlation heatmap |
+| `training.png` | Baseline loss + MAE curves |
+| `evaluation.png` | Scatter + residuals |
+| `attention.png` | Temporal attention weights |
+| `permutation_importance.png` | Feature importance (replaces shap.png) |
+| `ensemble.png` | Alpha sweep plot |
+| `dashboard.png` | Final summary dashboard |
+| `cme_lstm_fp16.tflite` | TFLite export (**currently failing — cell 18**) |
+
+---
+
+## What to Tell the New Chat
+
+> I'm working on a Google Colab notebook for CME arrival time prediction using a BiLSTM + Temporal Attention model in TensorFlow. The notebook has 19 cells and runs end-to-end except for one remaining error in **Cell 18** (TFLite export).
+>
+> The model is `CME_BiLSTM_Attn` — two Bidirectional LSTM layers (256, 128 units) with `recurrent_dropout=0.1` and `LayerNormalization`, followed by a unidirectional LSTM (64 units), a temporal attention block, and two Dense layers. Input shape is `(None, 10, 27)`. It was trained with mixed float16 precision on Colab T4.
+>
+> The TFLite conversion fails with:
+> `ConverterError: 'tf.TensorListReserve' op requires element_shape to be static`
+>
+> I've already tried adding `SELECT_TF_OPS` and setting `_experimental_lower_tensor_list_ops = False` but it still fails. The suspected cause is `recurrent_dropout=0.1` in the BiLSTM layers creating dynamic graph ops that can't be statically resolved. I need the fixed Cell 18 code — either by rebuilding the model for export without recurrent dropout and transferring weights, or by using a concrete function with a static input signature, or by skipping TFLite entirely and just saving the Keras + SavedModel formats.
