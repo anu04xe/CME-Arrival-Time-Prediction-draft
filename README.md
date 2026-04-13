@@ -21,7 +21,7 @@ When the Sun ejects a plasma cloud at a million miles per hour, operators have 1
 ## Results
 
 | Model | MAE (hours) | R² | Within ±6h | Within ±12h |
-|---|---|---|---|---|
+|---|11.473|-0.1647|74.7|36.0|
 | Baseline BiLSTM | — | — | — | — |
 | Optuna-tuned BiLSTM | — | — | — | — |
 | **BiLSTM + DBM Ensemble** | **—** | **—** | **—%** | **—%** |
