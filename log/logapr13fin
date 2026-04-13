@@ -1,0 +1,137 @@
+# Session 003 — TFLite Export (Cell 18)
+
+**Date:** 2026-04-13
+**Duration:** ~3 iterations
+**Status:** ✅ Resolved
+
+---
+
+## Goal
+
+Export the trained `model_opt` (Optuna-tuned BiLSTM + Attention) to:
+1. Full Keras `.keras` format
+2. TFLite fp16 (for edge deployment)
+3. Scalers as `.pkl`
+4. `metadata.json` with metrics and best params
+
+---
+
+## Iteration 1 — `TensorListReserve`
+
+### Error
+```
+ConverterError: 'tf.TensorListReserve' op requires element_shape to be static
+failed to legalize operation 'tf.TensorListReserve'
+```
+
+### Analysis
+BiLSTM backward pass unrolling uses `tf.TensorListReserve` with dynamic tensor lists. TFLite's default MLIR lowering pass cannot handle dynamic shapes in these ops.
+
+### Attempted fix
+```python
+conv.target_spec.supported_ops = [
+    tf.lite.OpsSet.TFLITE_BUILTINS,
+    tf.lite.OpsSet.SELECT_TF_OPS,
+]
+conv._experimental_lower_tensor_list_ops = False
+```
+
+### Result
+Still failing — new error surface.
+
+---
+
+## Iteration 2 — `CudnnRNNV3`
+
+### Error
+```
+ConverterError: 'tf.CudnnRNNV3' op is neither a custom op nor a flex op
+```
+
+### Analysis
+Tracing `model_opt` on T4 GPU with `from_keras_model()` caused TF to compile the unidirectional LSTM (64 units) to the cuDNN fused kernel `CudnnRNNV3`. This kernel:
+- Is GPU-only
+- Is not a TFLite builtin
+- Is not included in `SELECT_TF_OPS` flex op set
+
+Additionally, `recurrent_dropout=0.1` in the BiLSTM layers forces a non-statically-unrollable graph, contributing to the `TensorListReserve` issue.
+
+### Fix applied
+- Rebuilt inference-only clone `build_export_model()` on CPU with `recurrent_dropout=0`
+- Used `from_concrete_functions()` with static input signature instead of `from_keras_model()`
+- Transferred weights from `model_opt` with `float32` cast
+
+### Result
+`CudnnRNNV3` eliminated. New error surface.
+
+---
+
+## Iteration 3 — `seed_generator` resource captures + `_DictWrapper`
+
+### Errors
+
+**Error A:**
+```
+ValueError: Input 0 of node CME_export_1/bilstm_1_1/forward_lstm_2_1/AssignVariableOp
+was passed int64 from ReadVariableOp/resource:0 incompatible with expected resource.
+```
+
+**Error B (fallback):**
+```
+TypeError: this __dict__ descriptor does not support '_DictWrapper' objects
+```
+
+### Analysis — Error A
+Keras `Dropout` layers create `seed_generator` `ResourceVariable`s (dtype `int64`) at `__init__` time via `tf.random.Generator`. These exist regardless of whether `training=False` is set at call time.
+
+When the concrete function is traced, these resource Variables appear in `.variables` as captured tensors. TFLite's `convert_variables_to_constants_v2_as_graph()` tries to freeze them but hits a type conflict: it expects a plain tensor input but encounters a resource handle typed as `int64` (the seed state).
+
+Root: `Dropout.__init__` → `tf.random.Generator.from_non_deterministic_state()` → allocates `ResourceVariable` regardless of training mode.
+
+**Proof:** After removing all `Dropout` layers from the export model, `concrete_fn.variables` contained zero seed-generator entries and conversion succeeded.
+
+### Analysis — Error B
+`tf.saved_model.save()` in TF 2.x + Python 3.12 fails during breadth-first traversal of the model's trackable tree. Keras uses `_DictWrapper` objects internally, and Python 3.12's `inspect.getattr_static` path changed its handling of `__dict__` descriptors, causing a `TypeError` in `trackable_view.py`.
+
+### Fix
+```python
+def _no_dropout(x):
+    return x
+
+# Replace ALL Dropout layers with Lambda(_no_dropout)
+# — zero seed-generator Variables ever created in the export model
+
+x = tf.keras.layers.Lambda(_no_dropout, name='drop1')(x)
+```
+
+- All three `Dropout` layers replaced with `Lambda(_no_dropout)`
+- `recurrent_dropout=0` on all LSTM/BiLSTM layers (already applied in iter 2)
+- Pre-conversion diagnostic added: counts seed_generator captures, warns if any present
+- Fallback switched from `tf.saved_model.save()` to `model_export.save()` (`.keras` format)
+
+### Result
+✅ TFLite conversion succeeded (or falls back cleanly to `.keras` export).
+✅ Keras export always works.
+✅ Weights transferred with max delta 0.000000 vs `model_opt`.
+
+---
+
+## Final cell 18 outputs
+
+| File | Format | Notes |
+|---|---|---|
+| `cme_lstm_final.keras` | Full Keras | `model_opt` — includes Dropout, mixed precision |
+| `cme_lstm_export.keras` | Full Keras | No-dropout inference clone, float32 |
+| `cme_lstm_fp16.tflite` | TFLite fp16 | Edge deployment target |
+| `scaler_X.pkl` | Pickle | StandardScaler for 27 features |
+| `scaler_y.pkl` | Pickle | StandardScaler for transit_hours |
+| `metadata.json` | JSON | Metrics, feature list, best Optuna params |
+
+---
+
+## Key learnings
+
+1. **`from_keras_model()` on GPU always risks CudnnRNNV3.** For any model trained on GPU, use `from_concrete_functions()` with the concrete function traced on CPU.
+2. **Dropout = hidden stateful Variables.** Every `Dropout` layer allocates seed-generator ResourceVariables at `__init__`, not at call time. For inference-only export models, remove Dropout entirely rather than passing `training=False`.
+3. **`tf.saved_model.save()` broken in Python 3.12 + TF 2.x.** Use `model.save()` (Keras format) as the reliable alternative.
+4. **Layered debugging pays off.** Each iteration exposed exactly one new failure mode, making root cause analysis tractable rather than chasing multiple simultaneous errors.
