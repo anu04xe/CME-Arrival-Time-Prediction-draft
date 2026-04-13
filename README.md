@@ -9,6 +9,7 @@
 [![Status](https://img.shields.io/badge/Status-Complete-brightgreen)]()
 
 A deep learning pipeline that predicts the **transit time of Coronal Mass Ejections (CMEs)** from the Sun to Earth's L1 point — the critical early-warning window for satellite operators, grid managers, and space weather agencies.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/anu04xe/CME-Arrival-Time-Prediction-draft/blob/main/CME_Arrival_Time_Predictor.ipynb)
 
 ---
 
