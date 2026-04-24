@@ -27,7 +27,7 @@ When the Sun ejects a plasma cloud at a million miles per hour, operators have 1
 | Optuna-tuned BiLSTM | — | — | — | — |
 | **BiLSTM + DBM Ensemble** | **—** | **—** | **—%** | **—%** |
 
-> Fill in your actual numbers from `metadata.json` after running the notebook.
+> still a wip!
 
 ---
 
